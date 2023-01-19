@@ -1,0 +1,174 @@
+import pandas as pd 
+import numpy as np 
+import torch 
+import statsmodels as sm
+import torch.nn as nn 
+
+def calculate_spillovers(df):
+    # Create a dictionary to store the spillovers for each firm
+    spillovers = {}
+    
+    # Get the unique firms and industries
+    firms = df["firm_id"].unique()
+    industries = df["industry"].unique()
+    
+    # Iterate over the firms
+    for firm in firms:
+        # Get the R&D for the current firm
+        rd = df.loc[df["firm_id"] == firm, "R&D"].values[0]
+        
+        # Initialize the spillover for the current firm
+        spillover = 0
+        
+        # Iterate over the industries
+        for industry in industries:
+            # Get the rival firms in the current industry
+            rival_firms = df.loc[(df["industry"] == industry) & (df["firm_id"] != firm), "firm_id"]
+            
+            # Iterate over the rival firms
+            for rival in rival_firms:
+                # Get the R&D for the rival firm
+                rival_rd = df.loc[df["firm_id"] == rival, "R&D"].values[0]
+                
+                # Add the difference in R&D to the spillover
+                if rival_rd > rd:
+                    spillover += rival_rd - rd
+        
+        # Add the spillover for the current firm to the dictionary
+        spillovers[firm] = spillover
+    
+    return spillovers
+
+def gram_schmidt(X):
+    # number of observations
+    n = X.shape[0]
+    # number of features
+    k = X.shape[1]
+    
+    # create an empty list to store the orthogonalized variables
+    orthogonalized_X = []
+    # normalize the first variable
+    orthogonalized_X.append(X[:, 0] / torch.norm(X[:, 0]))
+    
+    for i in range(1, k):
+        # create a new variable
+        new_variable = X[:, i]
+        # subtract the projection of the new variable on the previous orthogonalized variables
+        for j in range(i):
+            new_variable -= torch.sum(torch.matmul(new_variable.view(-1,1), orthogonalized_X[j].view(1,-1)) * orthogonalized_X[j])
+        # normalize the new variable
+        new_variable /= torch.norm(new_variable)
+        # add the new variable to the list of orthogonalized variables
+        orthogonalized_X.append(new_variable)
+    # stack the orthogonalized variables to form the new X
+    return torch.stack(orthogonalized_X)
+
+def householder(X):
+    n, k = X.shape
+    Q = torch.eye(k, device=X.device)
+    for i in range(k):
+        x = X[:, i:i+1]
+        v = x.clone()
+        v[i:] = x[i:] - torch.norm(x[i:], dim=0) * Q[i:, i:i+1]
+        v = v / torch.norm(v, dim=0)
+        Q[i:, i:] = torch.eye(k-i, device=X.device) - 2 * torch.matmul(v, v.t())
+    return torch.matmul(X, Q)
+
+class LinearMixedEffectsModel(nn.Module):
+    def __init__(self, num_random_effects, num_fixed_effects,num_inputs):
+        super(LinearMixedEffectsModel, self).__init__()
+        self.random_effects = nn.Linear(num_random_effects, num_inputs)
+        self.fixed_effects = nn.Linear(num_inputs, num_fixed_effects)
+        self.dropout = nn.Dropout()
+        self.layer_norm = nn.LayerNorm(num_fixed_effects)
+
+    def forward(self, X, firm_indices):
+        X = self.dropout(X)
+        X = self.layer_norm(X)
+        random_effects = self.random_effects(firm_indices)
+        fixed_effects = self.fixed_effects(X)
+        return fixed_effects + random_effects
+
+
+#####STATSMODEL 
+df = None
+# Create an empty dataframe to store the results
+results_df = pd.DataFrame(columns=["year", "firm_id", "RQ"])
+
+# Define the starting and ending years for the data
+start_year = 1972
+end_year = 2015
+
+# Define the window size
+window = 10
+
+# Iterate over the years
+for year in range(start_year, end_year - window + 1):
+    # Subset the data for the current window
+    data_window = df[(df["year"] >= year) & (df["year"] < year + window)]
+    
+    # Fit the model for the current window
+    y = data_window["ln_output"]
+    X = data_window[["ln_capital", "ln_labor", "ln_R&D", "ln_advertising", "ln_spillovers"]]
+    X = sm.add_constant(X)
+    model = sm.MixedLM(y, X, groups=data_window["firm_id"])
+    result = model.fit()
+    
+    # Extract the RQ values for each firm
+    firms = data_window["firm_id"].unique()
+    RQ_values = result.random_effects.loc[firms, "beta3"]
+    
+    # Add the RQ values to the results dataframe
+    for firm in firms:
+        results_df = results_df.append({"year": year + window, "firm_id": firm, "RQ": RQ_values[firm]}, ignore_index=True)
+
+
+
+"""The BLUPS can be obtained using the random_effects attribute of the result object returned by the fit() method of
+ the MixedLM class. The attribute returns a DataFrame with the BLUPS of the random effects, including the firm-specific 
+ error term (beta3i in this case). Here is an example of how to obtain the BLUPS:"""
+# Fit the model
+y = df["ln_output"]
+X = df[["ln_capital", "ln_labor", "ln_R&D", "ln_advertising", "ln_spillovers"]]
+X = sm.add_constant(X)
+model = sm.MixedLM(y, X, groups=df["firm_id"])
+result = model.fit()
+
+# Extract the BLUPS of the random effects
+random_effects = result.random_effects
+
+# Extract the BLUP of the firm-specific error term
+beta3i = random_effects["beta3i"]
+
+# Calculate the RQ for each firm-year
+RQ = result.params[3] + beta3i
+
+#PYTORCH
+n_iterations = 50 
+
+# Get the indices of the firms in the data
+firm_indices = torch.tensor(df["firm_id"].map(lambda x: np.where(firms == x)[0][0]), dtype=torch.long)
+num_random_effects = firm_indices.shape[0]#or 1?
+
+# Initialize the model
+model = LinearMixedEffectsModel(num_random_effects, X.shape[1])
+
+# Define the loss function
+loss_fn = nn.MSELoss()
+
+# Define the optimizer
+optimizer = torch.optim.Adam(model.parameters())
+
+# Iterate over the number of iterations
+for i in range(n_iterations):
+    # Perform the forward pass
+    y_pred = model(X, firm_indices)
+
+    # Calculate the loss
+    loss = loss_fn(y_pred, y)
+
+    # Perform the backward pass and update the parameters
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
